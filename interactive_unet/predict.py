@@ -3,6 +3,8 @@ import glob
 import numpy as np
 
 import torch
+import time
+import resource
 
 from monai.inferers import sliding_window_inference
 from monai.inferers import SliceInferer
@@ -12,7 +14,7 @@ from interactive_unet import utils, unet
 def predict_slice(image_slice, num_channels=1, num_classes=2, return_probabilities=False):
 
     torch.set_float32_matmul_precision('medium')
-    
+
     # Get CUDA device if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -25,7 +27,7 @@ def predict_slice(image_slice, num_channels=1, num_classes=2, return_probabiliti
 
     # Convert image_slice to tensor in form BxCxWxH
     X = (image_slice[None,None,:,:] / 255).astype('float32')
-    X = torch.tensor(X).to(device) 
+    X = torch.tensor(X).to(device)
 
     # Predict slice
     y_prob = model(X).cpu().detach().numpy()
@@ -61,9 +63,9 @@ def predict_slice(image_slice, num_channels=1, num_classes=2, return_probabiliti
 
 #     # Predict volumes
 #     for f in volume_files:
-        
+
 #         volume = np.load(f) / 255
-        
+
 #         final_prediction = np.zeros((volume.shape[0], volume.shape[1], volume.shape[2], num_classes))
 
 #         for i in range(3):
@@ -93,14 +95,30 @@ def predict_slice(image_slice, num_channels=1, num_classes=2, return_probabiliti
 #             final_prediction += np.moveaxis(y_pred, 0, i)
 
 #         final_prediction = ((final_prediction / 3) * 255).astype('uint8')
-        
+
 #         # Save binary mask for each class
 #         for i in range(num_classes):
 #             save_path = f.replace('image_volumes', 'predicted_volumes')[:-4]
 #             np.save(f'{save_path}_{i}.npy', final_prediction[...,i])
 
 def predict_volumes(input_size=256, num_channels=1, num_classes=2):
+    start_time = time.time()
+    def memory_limit_percent():
+        """Limit max memory usage to half."""
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        # Convert KiB to bytes, and divide in two to half
+        resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 * 0.95), hard))
 
+    def get_memory():
+        with open('/proc/meminfo', 'r') as mem:
+            free_memory = 0
+            for i in mem:
+                sline = i.split()
+                if str(sline[0]) in ('MemFree:', 'Buffers:', 'Cached:'):
+                    free_memory += int(sline[1])
+        return free_memory  # KiB
+
+    memory_limit_percent()
     torch.set_float32_matmul_precision('medium')
 
     # Get CUDA device if available
@@ -120,13 +138,12 @@ def predict_volumes(input_size=256, num_channels=1, num_classes=2):
 
         # Predict volumes
         for f in volume_files:
-            
+
             volume = torch.tensor(np.load(f)[None,None,...] / 255.0, dtype=torch.float32)
-            
-            final_prediction = np.zeros((num_classes, volume.shape[-3], volume.shape[-2], volume.shape[-1]))
+            final_prediction = np.zeros((num_classes, volume.shape[-3], volume.shape[-2], volume.shape[-1]), dtype = np.float32)
 
             for i in range(3):
-            
+
                 print(f'Predicting volume {f}, view {i}.', flush=True)
 
                 inferer = SliceInferer(spatial_dim=i,
@@ -138,15 +155,15 @@ def predict_volumes(input_size=256, num_channels=1, num_classes=2):
                                        sw_device=device,
                                        device=torch.device('cpu'))
 
-                prediction = inferer(volume, model)[0].detach().cpu().numpy()
+                final_prediction += inferer(volume, model)[0].detach().cpu().numpy()
 
-                final_prediction += prediction
-
-            final_prediction = ((final_prediction / 3) * 255).astype('uint8')
-            
+            del volume
+            del inferer
+            final_prediction = ((final_prediction / 3) * 255).astype('uint8') #todo: maybe do that in several steps ?
             print(f'Saving predicted volume {f}...')
 
             # Save binary mask for each class
             for i in range(num_classes):
                 save_path = f.replace('image_volumes', 'predicted_volumes')[:-4]
                 np.save(f'{save_path}_{i}.npy', final_prediction[i])
+            print("--- %s seconds ---" % (time.time() - start_time))
